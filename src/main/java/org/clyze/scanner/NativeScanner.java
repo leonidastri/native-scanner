@@ -9,47 +9,19 @@ import java.util.*;
 public class NativeScanner {
     /** Enable debug messages. */
     private final static boolean debug = false;
-    private final NativeDatabaseConsumer dbc;
-    /** Use Radare to find strings. */
-    private final boolean useRadare;
-    /** Only output localized strings (i.e. found inside function
-     *  boundaries). When function boundaries can be determined, this
-     *  improves precision. */
-    private final boolean onlyPreciseNativeStrings;
+    /** The method strings to use for improving precision. */
     private final Set<String> methodStrings;
-    /** Truncate long addresses to fit 32 bits. Used for clients that
-     *  do not support 64-bit integers (such as Doop using some builds
-     *  of Souffle). */
-    private final boolean truncateAddresses;
-    /** Support name demangling for some analysis back ends. */
-    private final boolean demangle;
 
     /**
      * Create a native scanner object, to be used for analyzing native
      * libraries.
      *
-     * @param dbc                   the database consumer to receive the results
-     * @param useRadare             if true, use Radare2
-     * @param preciseNativeStrings  only keep native strings with enough information
-     * @param truncateAddresses     truncate long addresses to 32 bits
-     * @param demangle              demangle names for library entry points (may
-     *                              not be supported for all analysis modes)
      * @param methodStrings         a list of method substrings (names and
      *                              type descriptors) to use for filtering -- set to
      *                              null to disable this filtering
      */
-    public NativeScanner(NativeDatabaseConsumer dbc, boolean useRadare,
-                         boolean preciseNativeStrings, boolean truncateAddresses,
-                         boolean demangle, Set<String> methodStrings) {
-        this.dbc = dbc;
-        this.useRadare = useRadare;
-        this.onlyPreciseNativeStrings = preciseNativeStrings;
-        this.truncateAddresses = truncateAddresses;
+    public NativeScanner(Set<String> methodStrings) {
         this.methodStrings = methodStrings;
-        this.demangle = demangle;
-
-        if (useRadare && demangle)
-            System.err.println("WARNING: name demangling cannot be configured in Radare2 mode.");
 
         if (methodStrings != null)
             System.err.println("Initializing native scanner with " + methodStrings.size() + " strings related to methods.");
@@ -58,119 +30,101 @@ public class NativeScanner {
     }
 
     /**
-     * Returns the analysis mode used by the scanner.
+     * Scan a piece of native code.
      *
-     * @return true if Radare2 is used, false if the binutils-based approach is used.
+     * @param analysis   the binary analysis to use
      */
-    public boolean getMode() {
-        return this.useRadare;
-    }
+    public void scanBinaryCode(BinaryAnalysis analysis) {
+        String lib = analysis.getLib();
+        System.out.println("== Processing library: " + lib + " ==");
 
-    /**
-     * Scan a native code library.
-     *
-     * @param libFile        the native code library
-     */
-    public void scanLib(File libFile) {
-        try {
-            String lib = libFile.getCanonicalPath();
-            System.out.println("== Processing library: " + lib + " ==");
+        analysis.initEntryPoints();
 
-            BinaryAnalysis analysis = useRadare ?
-                new RadareAnalysis(dbc, lib, onlyPreciseNativeStrings, truncateAddresses)  :
-                new BinutilsAnalysis(dbc, lib, onlyPreciseNativeStrings, truncateAddresses, demangle);
-
-            analysis.initEntryPoints();
-
-            // Find all strings in the binary.
-            System.out.println("Gathering strings from " + lib + "...");
-            SortedMap<Long, String> allStrings = analysis.findStrings();
-            if (allStrings == null || allStrings.size() == 0) {
-                System.err.println("Cannot find strings in " + lib + ", aborting.");
-                return;
-            }
-            System.out.println("Total strings: " + allStrings.size());
-            if (debug)
-                allStrings.forEach ((k, v) -> System.out.println(k + " -> " + v));
-
-            // Filter the strings to work with a more manageable set
-            // of strings.
-            Map<String, List<SymbolInfo>> nameSymbols = new HashMap<>();
-            Map<String, List<SymbolInfo>> methodTypeSymbols = new HashMap<>();
-            SortedMap<Long, String> strings = new TreeMap<>();
-            for (Map.Entry<Long, String> foundString : allStrings.entrySet()) {
-                String s = foundString.getValue();
-                // Keep only those that were encountered in the input
-                // program as method names or signatures.
-                if (methodStrings != null && !methodStrings.contains(s)) {
-                    // System.err.println("Rejecting string: " + s);
-                    continue;
-                }
-                Long addr = foundString.getKey();
-                if (isMethodType(s)) {
-                    addSymbol(methodTypeSymbols, s, new SymbolInfo(s, lib, BinaryAnalysis.UNKNOWN_FUNCTION, addr));
-                    strings.put(addr, s);
-                } else if (isName(s)) {
-                    addSymbol(nameSymbols, s, new SymbolInfo(s, lib, BinaryAnalysis.UNKNOWN_FUNCTION, addr));
-                    strings.put(addr, s);
-                } else if (debug)
-                    // If this code runs, then a method-related string is not a name/type.
-                    System.err.println("WARNING: rejecting native string '" + s + "'");
-            }
-            System.out.println("Filter: " + strings.size() + " out of " + allStrings.size() + " survived.");
-            if (debug)
-                strings.forEach((k, v) -> System.out.println(k + " -> " + v));
-
-            // If name or method type sets are empty, do not continue,
-            // as their product will eventually be empty as well.
-            int namesCount = nameSymbols.keySet().size();
-            int methodTypesCount = methodTypeSymbols.keySet().size();
-            if (namesCount == 0 || methodTypesCount == 0) {
-                System.out.println("Product [name x type] is empty, ignoring native library.");
-                return;
-            } else {
-                System.out.println("Possible method/class names: " + namesCount);
-                System.out.println("Possible method types found: " + methodTypesCount);
-            }
-
-            // Find in which function every string is used.
-            long xrefsTime1 = System.currentTimeMillis();
-            Map<String, Set<XRef>> xrefs = analysis.findXRefs(strings);
-            long xrefsTime2 = System.currentTimeMillis();
-            System.out.println("Computed " + xrefs.size() + " xrefs (time: " + ((xrefsTime2 - xrefsTime1) / 1000.0) + " sec)");
-            if (debug)
-                xrefs.forEach ((k, v) -> System.out.println("XREF: '" + k + "' -> " + v) );
-
-            // Write out facts: first write names and method types that
-            // belong to known functions, then write everything else (that
-            // may be found via radare or parsing the .rodata section).
-            // For values that we know their containing function, we set special offsets.
-            for (String s : xrefs.keySet()) {
-                if (s == null)
-                    continue;
-                if (isMethodType(s)) {
-                    Set<XRef> strRefs = xrefs.get(s);
-                    if (strRefs != null)
-                        for (XRef strRef : strRefs)
-                            addSymbol(methodTypeSymbols, s, new SymbolInfo(s, lib, strRef.function, null));
-                } else if (isName(s)) {
-                    Set<XRef> strRefs = xrefs.get(s);
-                    if (strRefs != null)
-                        for (XRef strRef : strRefs)
-                            addSymbol(nameSymbols, s, new SymbolInfo(s, lib, strRef.function, null));
-                }
-            }
-
-            // Resolve "unknown function" info.
-            updateLibSymbolTable(nameSymbols, lib, xrefs);
-            updateLibSymbolTable(methodTypeSymbols, lib, xrefs);
-
-            // Finally write facts.
-            analysis.writeFacts(xrefs, nameSymbols, methodTypeSymbols);
-
-        } catch (IOException ex) {
-            ex.printStackTrace();
+        // Find all strings in the binary.
+        System.out.println("Gathering strings from " + lib + "...");
+        SortedMap<Long, String> allStrings = analysis.findStrings();
+        if (allStrings == null || allStrings.size() == 0) {
+            System.err.println("Cannot find strings in " + lib + ", aborting.");
+            return;
         }
+        System.out.println("Total strings: " + allStrings.size());
+        if (debug)
+            allStrings.forEach ((k, v) -> System.out.println(k + " -> " + v));
+
+        // Filter the strings to work with a more manageable set
+        // of strings.
+        Map<String, List<SymbolInfo>> nameSymbols = new HashMap<>();
+        Map<String, List<SymbolInfo>> methodTypeSymbols = new HashMap<>();
+        SortedMap<Long, String> strings = new TreeMap<>();
+        for (Map.Entry<Long, String> foundString : allStrings.entrySet()) {
+            String s = foundString.getValue();
+            // Keep only those that were encountered in the input
+            // program as method names or signatures.
+            if (methodStrings != null && !methodStrings.contains(s)) {
+                // System.err.println("Rejecting string: " + s);
+                continue;
+            }
+            Long addr = foundString.getKey();
+            if (isMethodType(s)) {
+                addSymbol(methodTypeSymbols, s, new SymbolInfo(s, lib, BinaryAnalysis.UNKNOWN_FUNCTION, addr));
+                strings.put(addr, s);
+            } else if (isName(s)) {
+                addSymbol(nameSymbols, s, new SymbolInfo(s, lib, BinaryAnalysis.UNKNOWN_FUNCTION, addr));
+                strings.put(addr, s);
+            } else if (debug)
+                // If this code runs, then a method-related string is not a name/type.
+                System.err.println("WARNING: rejecting native string '" + s + "'");
+        }
+        System.out.println("Filter: " + strings.size() + " out of " + allStrings.size() + " survived.");
+        if (debug)
+            strings.forEach((k, v) -> System.out.println(k + " -> " + v));
+
+        // If name or method type sets are empty, do not continue,
+        // as their product will eventually be empty as well.
+        int namesCount = nameSymbols.keySet().size();
+        int methodTypesCount = methodTypeSymbols.keySet().size();
+        if (namesCount == 0 || methodTypesCount == 0) {
+            System.out.println("Product [name x type] is empty, ignoring native library.");
+            return;
+        } else {
+            System.out.println("Possible method/class names: " + namesCount);
+            System.out.println("Possible method types found: " + methodTypesCount);
+        }
+
+        // Find in which function every string is used.
+        long xrefsTime1 = System.currentTimeMillis();
+        Map<String, Set<XRef>> xrefs = analysis.findXRefs(strings);
+        long xrefsTime2 = System.currentTimeMillis();
+        System.out.println("Computed " + xrefs.size() + " xrefs (time: " + ((xrefsTime2 - xrefsTime1) / 1000.0) + " sec)");
+        if (debug)
+            xrefs.forEach ((k, v) -> System.out.println("XREF: '" + k + "' -> " + v) );
+
+        // Write out facts: first write names and method types that
+        // belong to known functions, then write everything else (that
+        // may be found via radare or parsing the .rodata section).
+        // For values that we know their containing function, we set special offsets.
+        for (String s : xrefs.keySet()) {
+            if (s == null)
+                continue;
+            if (isMethodType(s)) {
+                Set<XRef> strRefs = xrefs.get(s);
+                if (strRefs != null)
+                    for (XRef strRef : strRefs)
+                        addSymbol(methodTypeSymbols, s, new SymbolInfo(s, lib, strRef.function, null));
+            } else if (isName(s)) {
+                Set<XRef> strRefs = xrefs.get(s);
+                if (strRefs != null)
+                    for (XRef strRef : strRefs)
+                        addSymbol(nameSymbols, s, new SymbolInfo(s, lib, strRef.function, null));
+            }
+        }
+
+        // Resolve "unknown function" info.
+        updateLibSymbolTable(nameSymbols, lib, xrefs);
+        updateLibSymbolTable(methodTypeSymbols, lib, xrefs);
+
+        // Finally write facts.
+        analysis.writeFacts(xrefs, nameSymbols, methodTypeSymbols);
     }
 
     private static boolean isName(String line) {
@@ -207,56 +161,52 @@ public class NativeScanner {
         return true;
     }
 
-    static List<String> runCommand(ProcessBuilder builder) throws IOException {
+    static List<String> runCommand(ProcessBuilder builder) {
         if (debug)
             System.err.println("Running external command: " + String.join(" ", builder.command()));
         builder.redirectErrorStream(true);
-        Process process = builder.start();
-        InputStream is = process.getInputStream();
-        BufferedReader reader = new BufferedReader(new InputStreamReader(is));
+        try {
+            Process process = builder.start();
+            InputStream is = process.getInputStream();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(is));
 
-        List<String> lines = new LinkedList<>();
-        String line;
-        while ((line = reader.readLine()) != null)
-            lines.add(line);
-        return lines;
+            List<String> lines = new LinkedList<>();
+            String line;
+            while ((line = reader.readLine()) != null)
+                lines.add(line);
+            return lines;
+        } catch (IOException ex) {
+            ex.printStackTrace();
+            throw new RuntimeException("Could not run command: " + String.join(" ", builder.command()));
+        }
     }
 
     /**
-     * Handle .xzs libraries (found in some .apk inputs).
+     * Unpack .xzs libraries (found in some .apk inputs).
      *
-     * @param xzsFile   the .xzs file
+     * @param xzsPath    the path to the .xzs file
+     * @return the path to the decompressed library
      */
-    public void scanXZSLib(File xzsFile) {
-        String xzsPath = xzsFile.getAbsolutePath();
+    public static String getXZSLib(String xzsPath) {
         System.out.println("Processing xzs-packed native code: " + xzsPath);
         String xzPath = xzsPath.substring(0, xzsPath.length() - 1);
-        try {
-            // Change .xzs extension to .xz.
-            runCommand(new ProcessBuilder("mv", xzsPath, xzPath));
-            runCommand(new ProcessBuilder("xz", "--decompress", xzPath));
-            File libTmpFile = new File(xzPath.substring(0, xzPath.length() - 3));
-            scanLib(libTmpFile);
-        } catch (IOException ex) {
-            ex.printStackTrace();
-        }
+        // Change .xzs extension to .xz.
+        runCommand(new ProcessBuilder("mv", xzsPath, xzPath));
+        runCommand(new ProcessBuilder("xz", "--decompress", xzPath));
+        return xzPath.substring(0, xzPath.length() - 3);
     }
 
     /**
      * Handle .zstd libraries (found in some .apk inputs).
-     * @param zstdFile   the .zstd file
+     *
+     * @param zstdPath   the path to the .zstd file
+     * @return the path to the decompressed library
      */
-    public void scanZSTDLib(File zstdFile) {
-        String zstdPath = zstdFile.getAbsolutePath();
+    public static String getZSTDLib(String zstdPath) {
         System.out.println("Processing zstd-packed native code: " + zstdPath);
         String zstdOutPath = zstdPath.substring(0, zstdPath.length() - 5);
-        try {
-            runCommand(new ProcessBuilder("zstd", "-d", "-o", zstdOutPath));
-            File libTmpFile = new File(zstdOutPath);
-            scanLib(libTmpFile);
-        } catch (IOException ex) {
-            ex.printStackTrace();
-        }
+        runCommand(new ProcessBuilder("zstd", "-d", "-o", zstdOutPath));
+        return zstdOutPath;
     }
 
     /**
@@ -306,6 +256,25 @@ public class NativeScanner {
                 l.add(new SymbolInfo(uString, lib, xref.function, j));
             }
         }
+    }
+
+    /**
+     * Factory method that creates a binary analysis for a target native code library.
+     *
+     * @param dbc                  the database consumer to use
+     * @param radareMode           if true, a Radare analysis will be returned, if false, a binutils analysis
+     * @param lib                  the path to the native code library
+     * @param onlyPreciseStrings   only record strings with known position in the code
+     * @param truncateAddresses    truncate addresses to 32-bit
+     * @param demangle             do name demanging (on binutils analysis)
+     * @return a binary analysis configured for the target native code library
+     */
+    public static BinaryAnalysis create(NativeDatabaseConsumer dbc, boolean radareMode,
+                                        String lib, boolean onlyPreciseStrings,
+                                        boolean truncateAddresses, boolean demangle) {
+        return radareMode ?
+            new RadareAnalysis(dbc, lib, onlyPreciseStrings, truncateAddresses)  :
+            new BinutilsAnalysis(dbc, lib, onlyPreciseStrings, truncateAddresses, demangle);
     }
 }
 

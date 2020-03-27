@@ -6,9 +6,16 @@ import java.util.*;
 /**
  * A binary analysis that is available to the native scanner.
  */
-abstract class BinaryAnalysis {
+public abstract class BinaryAnalysis {
 
-    /** Truncate long numbers for fact generation (for Souffle without 64-bit support). */
+    /** The name of the relation containing method name strings. */
+    public static final String NATIVE_NAME_CANDIDATE = "NATIVE_NAME_CANDIDATE";
+    /** The name of the relation containing method types (JVM-style method descriptors). */
+    public static final String NATIVE_METHODTYPE_CANDIDATE = "NATIVE_METHODTYPE_CANDIDATE";
+
+    /** Truncate long addresses to fit 32 bits. Used for clients that
+     *  do not support 64-bit integers (such as Doop using some builds
+     *  of Souffle). */
     private final boolean truncateTo32Bits;
 
     /** Dummy value for "offset" column in facts. */
@@ -21,14 +28,19 @@ abstract class BinaryAnalysis {
     /** The database connector to use for writing facts. */
     private final NativeDatabaseConsumer dbc;
     /** The native code library. */
-    final String lib;
+    protected final String lib;
     /** The entry points table. */
     final SortedMap<Long, String> entryPoints = new TreeMap<>();
-    /** String precision option. */
+    /** Only output localized strings (i.e. found inside function
+     *  boundaries). When function boundaries can be determined, this
+     *  improves precision. */
     private final boolean onlyPreciseNativeStrings;
 
+    /** A dictionary of library properties. */
+    protected Map<String, String> info = null;
+
     /** The native code architecture. */
-    Arch arch;
+    protected Arch libArch;
 
     BinaryAnalysis(NativeDatabaseConsumer dbc, String lib,
                    boolean onlyPreciseNativeStrings, boolean truncateTo32Bits) {
@@ -38,11 +50,7 @@ abstract class BinaryAnalysis {
         this.truncateTo32Bits = truncateTo32Bits;
 
         // Auto-detect architecture.
-        try {
-            this.arch = autodetectArch();
-        } catch (IOException ex) {
-            this.arch = Arch.DEFAULT_ARCH;
-        }
+        this.libArch = autodetectArch();
     }
 
     /**
@@ -50,11 +58,27 @@ abstract class BinaryAnalysis {
      *
      * @return a map of address-to-string entries
      */
-    public SortedMap<Long, String> findStrings() throws IOException {
-        Section rodata = getSection(".rodata");
-        if (rodata == null)
-            rodata = getSection(".rdata");
-        return rodata == null ? new TreeMap<>() : rodata.strings();
+    public SortedMap<Long, String> findStrings() {
+        try {
+            Section rodata = getSection(".rodata");
+            if (rodata == null)
+                rodata = getSection(".rdata");
+            if (rodata != null)
+                return rodata.strings();
+        } catch (IOException ex) {
+            ex.printStackTrace();
+            throw new RuntimeException("Could not read strings.");
+        }
+        return new TreeMap<>();
+    }
+
+    /**
+     * Returns the path of the analyzed binary.
+     *
+     * @return the native library path
+     */
+    public String getLib() {
+        return this.lib;
     }
 
     /**
@@ -63,30 +87,59 @@ abstract class BinaryAnalysis {
      * @param binStrings   the string table (offset-string entries)
      * @return             a mapping from strings to references in code
      */
-    abstract Map<String, Set<XRef>> findXRefs(Map<Long, String> binStrings) throws IOException;
+    abstract public Map<String, Set<XRef>> findXRefs(Map<Long, String> binStrings);
 
     /**
      * Initialize the entry points table of the library.
      */
-    abstract void initEntryPoints() throws IOException;
+    abstract public void initEntryPoints();
 
     /**
      * Autodetect the target hardware architecture.
+     *
+     * @return the architecture
      */
-    abstract protected Arch autodetectArch() throws IOException;
+    abstract public Arch autodetectArch();
+
+    /**
+     * A getter of the "info" field.
+     *
+     * @return the "info" mapping
+     */
+    abstract public Map<String, String> getNativeCodeInfo();
+
+    /**
+     * Autodetect the endianness of the target architecture.
+     *
+     * @return if true, architecture is little-endian, big-endian otherwise
+     */
+    public boolean isLittleEndian() {
+        return getNativeCodeInfo().get("endian").equals("little");
+    }
+
+    /**
+     * Determine the word size of the target architecture.
+     *
+     * @return the word size (in bytes)
+     */
+    abstract public int getWordSize();
 
     /**
      * Returns a list of pointer values that may point to global data.
      */
     private Set<Long> getGlobalDataPointers() throws IOException {
         Section data = getSection(".data");
-        return data == null ? null : data.analyzeWords();
+        return data == null ? null : data.analyzeWords(getWordSize(), isLittleEndian());
     }
 
     /**
      * Reads a section by name.
+     *
+     * @param sectionName   the name of the section in the binary
+     * @return a representation of interesting data in the section
+     * @throws IOException  if the section could not be read
      */
-    abstract Section getSection(String sectionName) throws IOException;
+    abstract public Section getSection(String sectionName) throws IOException;
 
     /**
      * Write the facts computed by the analysis.
@@ -103,8 +156,8 @@ abstract class BinaryAnalysis {
             System.err.println("Could not find global data pointers: " + ex.getMessage());
             dataPointers = new HashSet<>();
         }
-        writeSymbolTable("NATIVE_NAME_CANDIDATE", nameSymbols, xrefs, dataPointers);
-        writeSymbolTable("NATIVE_METHODTYPE_CANDIDATE", methodTypeSymbols, xrefs, dataPointers);
+        writeSymbolTable(NATIVE_NAME_CANDIDATE, nameSymbols, xrefs, dataPointers);
+        writeSymbolTable(NATIVE_METHODTYPE_CANDIDATE, methodTypeSymbols, xrefs, dataPointers);
 
         // Write xrefs.
         xrefs.forEach((s, refs) -> refs.forEach(xr -> writeXRef(s, xr)));

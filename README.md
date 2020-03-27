@@ -24,26 +24,22 @@ The resulting binary is in `build/install/native-scanner/bin/native-scanner`.
 
 ### Library ###
 
-Run the following command to publish the native scanner to the local
-Maven repository:
-
-```
-./gradlew publishToMavenLocal
-```
-
-Add `mavenLocal()` as a repository in your application build.gradle
-and add dependency:
+Add the Bintray repository in your application build.gradle
+and add the library as a dependency:
 
 ```
 repositories {
-  mavenLocal()
+  maven { url 'https://dl.bintray.com/gfour/plast-lab' }
   ...
 }
 
 dependencies {
-  implementation 'org.clyze:native-scanner:1.0.0'
+  implementation 'org.clyze:native-scanner:0.5.0'
 }
 ```
+
+Note: this project also supports publishing to the local Maven
+repository via `./gradlew publishToMavenLocal`.
 
 ### Binutils mode ###
 
@@ -62,10 +58,10 @@ or equivalent binary SDK distribution).
 ## Use ##
 
 For the standalone application, pass `--help` to see the available
-options. The results will be printed on screen.
+options.
 
-For the library, instantiate a NativeScanner object and use its
-`scanLib()` method to scan a native library. To consume the results,
-implement interface `DatabaseConsumer`. See the standalone entry point
-org.clyze.scanner.Main.main() for an actual piece of code using this
-library.
+For the library, instantiate a NativeScanner object and a BinaryAnalysis
+object, and use method `NativeScanner.scanBinaryCode()` to scan a native
+library. To consume the results, implement interface `NativeDatabaseConsumer`.
+See the standalone entry point org.clyze.scanner.Main.main() for an actual
+piece of code using this library.

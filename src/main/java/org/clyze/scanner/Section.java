@@ -4,10 +4,11 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.util.*;
 
-// A representation of a section in a binary.
-class Section {
+/**
+ * A representation of a section in a binary.
+ */
+public class Section {
     private final String name;
-    private final Arch arch;
     private final String lib;
     private final int size;
     private final long vma;
@@ -15,9 +16,8 @@ class Section {
     private SortedMap<Long, String> foundStrings;
     private final Set<Long> words;
 
-    Section(String name, Arch arch, String lib, int size, long vma, long offset) {
+    Section(String name, String lib, int size, long vma, long offset) {
         this.name = name;
-        this.arch = arch;
         this.lib = lib;
         this.size = size;
         this.vma = vma;
@@ -80,25 +80,11 @@ class Section {
     /**
      * Return the data as a set of machine-word pointers.
      *
+     * @param wordSize       the word size of the architecture
+     * @param littleEndian   the endianness of the architecture
      * @return a set of machine word values
      */
-    public Set<Long> analyzeWords() {
-        int wordSize;
-        boolean littleEndian;
-
-        switch (arch) {
-        case X86:
-            littleEndian = true;
-            wordSize = 4;
-            break;
-        case X86_64:
-            littleEndian = true;
-            wordSize = 8;
-            break;
-        default:
-            System.err.println("ERROR: analyzeWords() does not yet support " + arch);
-            return words;
-        }
+    public Set<Long> analyzeWords(int wordSize, boolean littleEndian) {
 
         int countSize = size;
         if (size % wordSize != 0) {
